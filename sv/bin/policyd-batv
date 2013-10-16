@@ -1,0 +1,81 @@
+#!/usr/bin/python
+
+## tkooda : 2008-07-24 : policyd-batv : python postfix policy daemon to accept/reject messages (e.g. skipping rest of (e.g. reject_rbl_client) checks in smtpd_recipient_restrictions) on per-sender+recipient basis
+# rationale:
+#  - all invalid/expired BATV hashes should be rejected immediately (perhaps with mini-explanation)
+#  - all valid BATV hashes are bounces(/replies) to messages we DID send (return "action=accept" and let the message pass onto the batv-milter re-write recipeient before message is vmapped to the local mailbox)
+
+
+import os
+import sys
+import re
+import time
+import sha
+
+
+# set defaults..
+settings = {
+	"SECONDS" : 60 * 60 * 24 * 7,
+	"BATV_KEY" : "ChangeThis",
+}
+
+	  
+def warn( msg ):
+	print >>sys.stderr, "policyd-batv: warning: pid %d : %s" % ( os.getpid(), msg )
+	sys.stderr.flush()
+
+def bail( act, infostr="" ):
+	extra = ""
+	if infostr:
+		extra = " : info=%s" % infostr
+	print >>sys.stderr, "policyd-batv: info: pid %d : %s: action=%s%s" % ( os.getpid(), args, act, extra )
+	sys.stderr.flush()
+	sys.stdout.write( "action=%s\n\n" % act )
+	sys.stdout.flush()
+	sys.exit( 0 )
+
+
+# optionally override defaults ..
+for s in settings.keys():
+	e = os.getenv( s )
+	if e:
+		settings[ s ] = e
+
+
+var_sender = False
+var_recipt = False
+args = ""
+line = sys.stdin.readline()
+while line:
+	if len( line ) < 2:
+		break
+#	print >>sys.stderr, "DEBUG: line:", line ,
+	line = line.rstrip( "\n" )
+	args += line + ", "
+	if len( line ) >= 7 and line[:7] == "sender=":
+		var_sender = line[7:].lower()
+	elif len( line ) >= 10 and line[:10] == "recipient=":
+		var_recipt = line[10:].lower()
+	line = sys.stdin.readline()
+
+# validate args ..
+if not var_sender:
+   bail( "dunno", "missing_sender" )
+if not var_recipt:
+   bail( "dunno", "missing_recipient" )
+
+# check for batv signature ..
+# e.g.: "batv-`date +%s`-`date +%s${key} |openssl sha1 |cut -b-8`-test@example.com"
+sig = re.compile( "^batv-([0-9]{10})\.([0-9a-f]{8})-(.+)$", re.I ).match( var_recipt )
+if not sig:
+   bail( "dunno", "skipping_non-batv_recipient: %s" % var_recipt )
+
+# validate batv signature ..
+sig_epoch = int( sig.group( 1 ) )
+sig_hash = sig.group( 2 )
+if int( time.time() ) > int( sig_epoch ) + int( settings[ "SECONDS" ] ):
+	bail( "reject (BATV) bounce address expired", "batv_signature_expired: %s" % var_recipt ) # FIXME: give more explanation to bounce message?
+if sig_hash != sha.sha( "%d%s" % ( sig_epoch, settings[ "BATV_KEY" ] ) ).hexdigest()[:8]:
+	bail( "reject (BATV) bounce address invalid", "invalid_batv_hash: %s" % var_recipt )
+bail( "accept", "valid_batv_signature_found: %s" % var_recipt ) # pass-through to let milter-batv rewrite recipient before postfix attempts to deliver locally
+
